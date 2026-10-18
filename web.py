@@ -12,11 +12,12 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import JSON as JSONCol, BigInteger, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
+
+import admin
+import auth
+from db import ParseLog, Post, async_session, ensure_schema, get_setting
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -106,44 +107,40 @@ STOP_WORDS = frozenset({
     "акция", "акции", "тикер", "канал", "пост", "новость", "новости",
 })
 
-# ─── Database ────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+# ─── Database: модели и engine живут в db.py (общий модуль с auth/admin/parser) ───
+APP_VERSION = "2.0.0"
 
-Base = declarative_base()
-engine = create_async_engine(DATABASE_URL)
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+app = FastAPI(title="TG Parser", version=APP_VERSION)
+
+# Публичные пути: RSS-фиды (Пульс читает без логина), логин, health.
+PUBLIC_PATHS = ("/rss", "/rss/news", "/rss/analytics", "/login", "/api/auth/login", "/health")
 
 
-class Post(Base):
-    __tablename__ = "posts"
-    id = Column(Integer, primary_key=True)
-    channel_id = Column(Integer, index=True)
-    telegram_message_id = Column(BigInteger)
-    text = Column(Text)
-    views_count = Column(Integer, default=0)
-    forwards_count = Column(Integer, default=0)
-    replies_count = Column(Integer, default=0)
-    hashtags = Column(JSONCol, default=list)
-    forward_from = Column(String(255))
-    published_at = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+@app.middleware("http")
+async def auth_guard(request, call_next):
+    path = request.url.path
+    if path in PUBLIC_PATHS or path.startswith("/rss/"):
+        return await call_next(request)
+    if await auth.get_current_user(request):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return RedirectResponse(url="/login", status_code=302)
 
 
-class ParseLog(Base):
-    __tablename__ = "parse_logs"
-    id = Column(Integer, primary_key=True)
-    posts_parsed = Column(Integer, default=0)
-    posts_new = Column(Integer, default=0)
-    duration_ms = Column(Integer)
-    error_message = Column(Text)
-    started_at = Column(DateTime(timezone=True))
+@app.on_event("startup")
+async def _startup():
+    await ensure_schema()
+    await auth.ensure_admin()
 
 
-app = FastAPI()
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": APP_VERSION}
+
+
+app.include_router(auth.router)
+app.include_router(admin.router)
 
 
 def json_response(data, status=200):
@@ -2022,6 +2019,81 @@ async def rss_feed(
     except Exception as e:
         logger.error(f"/rss error: {e}"); traceback.print_exc()
         return json_response({"error": str(e)}, 500)
+
+
+# ─── RSS потоки по типу: новости / аналитика ─────────────────
+# Списки каналов админ размечает в /admin (channels.feed_type).
+# Названия фидов — из settings (меняются в админке), fallback — env, дефолт ниже.
+_FEED_DEFAULTS = {"news": "Новости", "analytics": "Аналитика"}
+
+
+def _rss_xml(rows, rss_title, rss_link, rss_desc):
+    from email.utils import format_datetime
+    items = []
+    for (msg_id, body, pub, ch_username, ch_title) in rows:
+        body = body or ""
+        ch_username = ch_username or "channel"
+        ch_title = ch_title or ch_username
+        title = body[:100].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        desc = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        link = f"https://t.me/{ch_username}/{msg_id}"
+        pub_date = format_datetime(pub) if pub else ""
+        source_title = ch_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        items.append(f"""<item>
+<title>{title}</title>
+<link>{link}</link>
+<description>{desc}</description>
+<pubDate>{pub_date}</pubDate>
+<guid>{link}</guid>
+<source url="https://t.me/{ch_username}">{source_title}</source>
+</item>""")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+<title>{rss_title}</title>
+<link>{rss_link}</link>
+<description>{rss_desc}</description>
+<language>ru</language>
+<lastBuildDate>{format_datetime(datetime.now())}</lastBuildDate>
+{chr(10).join(items)}
+</channel>
+</rss>"""
+
+
+async def _typed_rss(feed_type: str, limit: int):
+    try:
+        async with async_session() as session:
+            title = await get_setting(session, f"rss_{feed_type}_title", "")
+            if not title:
+                title = os.getenv(f"RSS_{feed_type.upper()}_TITLE", _FEED_DEFAULTS[feed_type])
+            result = await session.execute(text("""
+                SELECT p.telegram_message_id, p.text, p.published_at,
+                       c.username, c.title
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE c.feed_type = :ft AND c.is_active
+                ORDER BY p.published_at DESC
+                LIMIT :limit
+            """), {"ft": feed_type, "limit": limit})
+            rss = _rss_xml(result.fetchall(), title, "https://t.me/", title)
+            return HTMLResponse(
+                content=rss,
+                media_type="application/rss+xml; charset=utf-8",
+                headers={"Cache-Control": "max-age=300, public"}
+            )
+    except Exception as e:
+        logger.error(f"/rss/{feed_type} error: {e}"); traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
+
+
+@app.get("/rss/news")
+async def rss_news(limit: int = Query(50, ge=1, le=200)):
+    return await _typed_rss("news", limit)
+
+
+@app.get("/rss/analytics")
+async def rss_analytics(limit: int = Query(50, ge=1, le=200)):
+    return await _typed_rss("analytics", limit)
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────

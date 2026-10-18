@@ -57,5 +57,24 @@ services:
     profiles:
       - scheduler  # docker compose --profile scheduler up
 
+  # ─── Web dashboard (v2: админка за логином) ──────────────
+  web:
+    build: .
+    container_name: mt_web
+    environment:
+      APP_MODE: "web"
+      PORT: "10000"
+      DATABASE_URL: postgresql+asyncpg://tgparser:tgparser_secret@postgres/tgparser
+      JWT_SECRET: ${JWT_SECRET:-dev_secret_change_me}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      RSS_NEWS_TITLE: ${RSS_NEWS_TITLE:-Новости}
+      RSS_ANALYTICS_TITLE: ${RSS_ANALYTICS_TITLE:-Аналитика}
+    ports:
+      - "10000:10000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
