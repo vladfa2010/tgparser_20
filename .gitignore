@@ -1,23 +1,5 @@
-# Environment
-.env
-
-# Telethon sessions
-sessions/
-*.session
-*.session-journal
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
-
-# Docker
-*.log
-
-# IDE
-.vscode/
-.idea/
-*.swp
+*.pyc
+.env
+.DS_Store
+sessions/
