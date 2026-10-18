@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-Parser for @markettwits Telegram channel
-Saves posts to PostgreSQL database
-Docker-ready: supports env vars, scheduled mode, persistent sessions
+TG Parser v2 — Telegram channel parser.
+
+v2 changes vs v1:
+  - Channel list comes from the DB (channels.is_active), managed in /admin.
+    Env CHANNELS remains a first-run seed fallback.
+  - Upsert instead of N+1 duplicate SELECTs: INSERT ... ON CONFLICT
+    (channel_id, telegram_message_id) DO UPDATE — every run refreshes
+    views/forwards/replies and overwrites edited posts (edit_date).
+  - Per-channel run mode:
+      * backfill_full flag (admin «Докачать всё») → full history, flag cleared on success;
+      * no posts yet for the channel → last 2000 messages (first import);
+      * otherwise → sliding window of the last 500 messages (update mode).
+  - HISTORY=1 env keeps v1 behavior: full history for all channels (one-off backfill).
 """
 import asyncio
 import hashlib
@@ -14,14 +24,13 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from sqlalchemy import (
-    JSON, BigInteger, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, select
-)
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import declarative_base
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
+
+from db import Channel, ParseLog, Post, async_session, ensure_schema
 
 load_dotenv()
 
@@ -30,29 +39,20 @@ TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 TG_SESSION = os.getenv("TG_SESSION", "/app/sessions/markettwits_session")
-# Comma-separated list of sources (channels, groups, chats)
-# Supports: username (@markettwits → markettwits), invite link, chat ID
-# Examples: "markettwits,mygroup,-1001234567890"
+# Fallback/first-run seed only: the live source of truth is the DB (see /admin).
 _CHANNELS_ENV = os.getenv("CHANNELS", os.getenv("CHANNEL_USERNAME", "markettwits"))
 CHANNELS = [c.strip() for c in _CHANNELS_ENV.split(",") if c.strip()]
-
-# New: CHATS env var for groups/chats you're a member of
-_CHATS_ENV = os.getenv("CHATS", "")
-CHATS = [c.strip() for c in _CHATS_ENV.split(",") if c.strip()]
 SCHEDULE_MODE = os.getenv("SCHEDULE_MODE", "0") == "1"
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "300"))
 HISTORY = os.getenv("HISTORY", "0") == "1"
 LIMIT = os.getenv("LIMIT")
 LIMIT = int(LIMIT) if LIMIT else None
 
-# ─── Database URL ────────────────────────────────────────────
-# Render дает postgres://... или postgresql://...
-# SQLAlchemy async требует postgresql+asyncpg://
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+# Sliding window sizes (ТЗ-tgparser-01, Задача 3)
+WINDOW_SIZE = 500          # обновление счётчиков/правок каждый прогон
+FIRST_IMPORT_SIZE = 2000   # первичная докачка нового канала
+FLUSH_EVERY = 200          # пакет upsert-ов между commit'ами
+
 
 def _validate():
     if not TG_API_ID or TG_API_ID == 0:
@@ -65,85 +65,24 @@ def _validate():
         print("ERROR: Either TG_STRING_SESSION env var or file session required.")
         print("Run 'python generate_session.py' locally to get a string session.")
         sys.exit(1)
-    if not DATABASE_URL:
-        print("ERROR: DATABASE_URL env var not set")
-        sys.exit(1)
-
-# ─── Database ────────────────────────────────────────────────
-Base = declarative_base()
-engine = None
-async_session = None
-
-def _init_engine():
-    global engine, async_session
-    if engine is None:
-        engine = create_async_engine(DATABASE_URL)
-        async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# ─── Models ──────────────────────────────────────────────────
-class Channel(Base):
-    __tablename__ = "channels"
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True)
-    username = Column(String(255), unique=True, index=True)
-    title = Column(String(500))
-    description = Column(Text)
-    subscriber_count = Column(Integer, default=0)
-    is_active = Column(Boolean, default=True)
-    last_parsed_at = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-
-
-class Post(Base):
-    __tablename__ = "posts"
-    id = Column(Integer, primary_key=True)
-    channel_id = Column(Integer, index=True)
-    telegram_message_id = Column(BigInteger)
-    text = Column(Text)
-    text_hash = Column(String(64), index=True)
-    views_count = Column(Integer, default=0)
-    forwards_count = Column(Integer, default=0)
-    replies_count = Column(Integer, default=0)
-    hashtags = Column(JSON, default=list)
-    mentions = Column(JSON, default=list)
-    urls = Column(JSON, default=list)
-    forward_from = Column(String(255))
-    has_media = Column(Boolean, default=False)
-    media_type = Column(String(50))
-    published_at = Column(DateTime(timezone=True))
-    edited_at = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    __table_args__ = (UniqueConstraint("channel_id", "telegram_message_id"),)
-
-
-class ParseLog(Base):
-    __tablename__ = "parse_logs"
-    id = Column(Integer, primary_key=True)
-    channel_id = Column(Integer)
-    posts_parsed = Column(Integer, default=0)
-    posts_new = Column(Integer, default=0)
-    duration_ms = Column(Integer)
-    error_message = Column(Text)
-    started_at = Column(DateTime(timezone=True))
-    finished_at = Column(DateTime(timezone=True))
 
 
 # ─── Helpers ─────────────────────────────────────────────────
-def extract_hashtags(text: str) -> list:
+def extract_hashtags(text_: str) -> list:
     # #\w+ only catches Latin; #\S+ catches everything after # until whitespace
-    return re.findall(r'#\S+', text) if text else []
+    return re.findall(r'#\S+', text_) if text_ else []
 
 
-def extract_mentions(text: str) -> list:
-    return re.findall(r'@\w+', text) if text else []
+def extract_mentions(text_: str) -> list:
+    return re.findall(r'@\w+', text_) if text_ else []
 
 
-def extract_urls(text: str) -> list:
-    return re.findall(r'https?://[^\s]+', text) if text else []
+def extract_urls(text_: str) -> list:
+    return re.findall(r'https?://[^\s]+', text_) if text_ else []
 
 
-def make_text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest() if text else ""
+def make_text_hash(text_: str) -> str:
+    return hashlib.sha256(text_.encode()).hexdigest() if text_ else ""
 
 
 def get_media_type(message: Message) -> Optional[str]:
@@ -158,6 +97,10 @@ def get_media_type(message: Message) -> Optional[str]:
     return "other"
 
 
+def _normalize_username(u: str) -> str:
+    return u.strip().lstrip("@").lower()
+
+
 # ─── Parser ──────────────────────────────────────────────────
 class MarketTwitsParser:
     def __init__(self):
@@ -170,170 +113,184 @@ class MarketTwitsParser:
         self.client = TelegramClient(session, TG_API_ID, TG_API_HASH)
 
     async def init_db(self):
-        _init_engine()
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        await ensure_schema()
 
-    async def sync_channel(self, session: AsyncSession, username: str) -> int:
-        entity = await self.client.get_entity(username)
+    # ─── Channel list: DB first, env as first-run seed ───────
+    async def get_channels(self, session) -> list[Channel]:
+        rows = (await session.execute(
+            select(Channel).where(Channel.is_active).order_by(Channel.username)
+        )).scalars().all()
+        if rows:
+            return rows
+        # Пустая таблица → сидим из env (первый запуск / локалка)
+        if not CHANNELS:
+            return []
+        feed_map: dict[str, str] = {}
+        for feed_type, env_name in (("news", "NEWS_CHANNELS"), ("analytics", "ANALYTICS_CHANNELS")):
+            for u in os.getenv(env_name, "").split(","):
+                u = _normalize_username(u)
+                if u:
+                    feed_map[u] = feed_type
+        for username in CHANNELS:
+            session.add(Channel(
+                username=_normalize_username(username),
+                is_active=True,
+                feed_type=feed_map.get(_normalize_username(username)),
+                title="@" + _normalize_username(username),
+            ))
+        await session.flush()
+        print(f"Seeded {len(CHANNELS)} channel(s) from env into DB")
+        return (await session.execute(
+            select(Channel).where(Channel.is_active).order_by(Channel.username)
+        )).scalars().all()
 
-        result = await session.execute(
-            select(Channel).where(Channel.username == username)
+    async def sync_channel(self, session, channel: Channel) -> None:
+        """Refresh telegram metadata; admin-added rows have telegram_id=None."""
+        entity = await self.client.get_entity(channel.username)
+        channel.telegram_id = entity.id
+        channel.title = entity.title
+        channel.description = getattr(entity, "about", None)
+        channel.subscriber_count = getattr(entity, "participants_count", 0) or 0
+
+    def _message_values(self, channel_db_id: int, message: Message) -> dict:
+        text_ = message.text or ""
+        forward_from = None
+        if message.forward and message.forward.chat:
+            forward_from = message.forward.chat.username or message.forward.chat.title
+        return dict(
+            channel_id=channel_db_id,
+            telegram_message_id=message.id,
+            text=text_,
+            text_hash=make_text_hash(text_),
+            views_count=message.views or 0,
+            forwards_count=message.forwards or 0,
+            replies_count=message.replies.replies if message.replies else 0,
+            hashtags=extract_hashtags(text_),
+            mentions=extract_mentions(text_),
+            urls=extract_urls(text_),
+            forward_from=forward_from,
+            has_media=message.media is not None,
+            media_type=get_media_type(message),
+            published_at=message.date,
+            edited_at=message.edit_date,
         )
-        channel = result.scalar_one_or_none()
 
-        if not channel:
-            channel = Channel(
-                telegram_id=entity.id,
-                username=username,
-                title=entity.title,
-                description=getattr(entity, "about", None),
-                subscriber_count=getattr(entity, "participants_count", 0),
-            )
-            session.add(channel)
-            await session.flush()
+    def _upsert_stmt(self, values_list: list):
+        stmt = pg_insert(Post).values(values_list)
+        # Перезаписываем только изменяемые поля; published_at/created_at — от первой вставки.
+        return stmt.on_conflict_do_update(
+            index_elements=["channel_id", "telegram_message_id"],
+            set_={
+                "text": stmt.excluded.text,
+                "text_hash": stmt.excluded.text_hash,
+                "views_count": stmt.excluded.views_count,
+                "forwards_count": stmt.excluded.forwards_count,
+                "replies_count": stmt.excluded.replies_count,
+                "hashtags": stmt.excluded.hashtags,
+                "mentions": stmt.excluded.mentions,
+                "urls": stmt.excluded.urls,
+                "forward_from": stmt.excluded.forward_from,
+                "has_media": stmt.excluded.has_media,
+                "media_type": stmt.excluded.media_type,
+                "edited_at": stmt.excluded.edited_at,
+            },
+        )
+
+    async def parse_channel(self, session, channel: Channel, history: bool = False):
+        """Parse a single channel: upsert window / full history depending on mode."""
+        # Перечитываем канал в текущей сессии (изменения флага backfill должны сохраняться)
+        channel = await session.get(Channel, channel.id)
+        await self.sync_channel(session, channel)
+
+        post_count = (await session.execute(
+            select(func.count()).select_from(Post).where(Post.channel_id == channel.id)
+        )).scalar() or 0
+
+        if history:
+            window, mode = None, "HISTORY (полная история)"
+        elif channel.backfill_full:
+            window, mode = None, "BACKFILL (полная история по флагу)"
+        elif post_count == 0:
+            window, mode = FIRST_IMPORT_SIZE, f"FIRST IMPORT (последние {FIRST_IMPORT_SIZE})"
         else:
-            channel.title = entity.title
-            channel.subscriber_count = getattr(entity, "participants_count", 0)
+            window, mode = WINDOW_SIZE, f"UPDATE (окно {WINDOW_SIZE})"
+        if LIMIT:
+            window, mode = LIMIT, f"LIMIT={LIMIT}"
 
-        return channel.id
+        entity = await self.client.get_entity(channel.username)
+        print(f"  [{channel.username}] mode={mode}, stored posts={post_count}")
 
-    async def parse_channel(self, session: AsyncSession, channel_username: str, channel_db_id: int, limit: Optional[int] = None, history: bool = False):
-        """Parse a single channel."""
-        last_id = 0
-        if not history:
-            result = await session.execute(
-                select(Post)
-                .where(Post.channel_id == channel_db_id)
-                .order_by(Post.telegram_message_id.desc())
-                .limit(1)
-            )
-            last_post = result.scalar_one_or_none()
-            if last_post:
-                last_id = last_post.telegram_message_id
-                print(f"  [{channel_username}] Resuming from message_id {last_id}")
-
-        entity = await self.client.get_entity(channel_username)
         parsed_count = 0
         new_count = 0
+        pending: list[dict] = []
 
-        async for message in self.client.iter_messages(
-            entity, limit=limit, min_id=last_id if not history else 0
-        ):
+        async def flush():
+            nonlocal new_count
+            if not pending:
+                return
+            res = await session.execute(
+                self._upsert_stmt(pending).returning(text("(xmax = 0) AS was_inserted"))
+            )
+            new_count += sum(1 for r in res.fetchall() if r[0])
+            pending.clear()
+            await session.commit()
+
+        async for message in self.client.iter_messages(entity, limit=window):
             if not message.text and not message.media:
                 continue
-
             parsed_count += 1
+            pending.append(self._message_values(channel.id, message))
+            if len(pending) >= FLUSH_EVERY:
+                await flush()
 
-            # Skip duplicates
-            result = await session.execute(
-                select(Post).where(
-                    (Post.channel_id == channel_db_id)
-                    & (Post.telegram_message_id == message.id)
-                )
-            )
-            if result.scalar_one_or_none():
-                continue
+        await flush()
 
-            text = message.text or ""
-            forward_from = None
-            if message.forward and message.forward.chat:
-                forward_from = (
-                    message.forward.chat.username
-                    or message.forward.chat.title
-                )
-
-            post = Post(
-                channel_id=channel_db_id,
-                telegram_message_id=message.id,
-                text=text,
-                text_hash=make_text_hash(text),
-                views_count=message.views or 0,
-                forwards_count=message.forwards or 0,
-                replies_count=message.replies.replies
-                if message.replies
-                else 0,
-                hashtags=extract_hashtags(text),
-                mentions=extract_mentions(text),
-                urls=extract_urls(text),
-                forward_from=forward_from,
-                has_media=message.media is not None,
-                media_type=get_media_type(message),
-                published_at=message.date,
-                edited_at=message.edit_date,
-            )
-            session.add(post)
-            new_count += 1
-
-            if new_count % 100 == 0:
-                await session.commit()
-                print(f"  [{channel_username}] Saved {new_count} new posts...")
-
-        await session.commit()
-
-        # Update channel
-        result = await session.execute(
-            select(Channel).where(Channel.id == channel_db_id)
-        )
-        channel = result.scalar_one()
         channel.last_parsed_at = datetime.utcnow()
-        await session.commit()
+        if channel.backfill_full and parsed_count > 0:
+            channel.backfill_full = False
+            print(f"  [{channel.username}] backfill done, flag cleared")
 
         return parsed_count, new_count
 
-    async def parse(self, limit: Optional[int] = None, history: bool = False):
-        """Parse all configured channels."""
+    async def parse(self, history: bool = False):
+        """Parse all active channels from the DB."""
         start_time = time.time()
-
         total_parsed = 0
         total_new = 0
 
-        for channel_username in CHANNELS:
+        async with async_session() as session:
+            channels = await self.get_channels(session)
+            await session.commit()
+
+        if not channels:
+            print("No active channels in DB and CHANNELS env is empty — nothing to do.")
+            return
+
+        for channel in channels:
             print(f"\n{'='*50}")
-            print(f"Parsing channel: {channel_username}")
+            print(f"Parsing channel: @{channel.username}")
             print(f"{'='*50}")
 
-            log = ParseLog(
-                started_at=datetime.utcnow(),
-            )
-            channel_parsed = 0
-            channel_new = 0
+            log = ParseLog(started_at=datetime.utcnow(), channel_id=channel.id)
 
             async with async_session() as session:
+                parsed, new = 0, 0
                 try:
-                    channel_db_id = await self.sync_channel(session, channel_username)
-                    log.channel_id = channel_db_id
-
-                    channel_parsed, channel_new = await self.parse_channel(
-                        session, channel_username, channel_db_id,
-                        limit=limit, history=history
-                    )
-
-                    total_parsed += channel_parsed
-                    total_new += channel_new
-
-                    # Save log
-                    log.posts_parsed = channel_parsed
-                    log.posts_new = channel_new
-                    log.duration_ms = int((time.time() - start_time) * 1000)
-                    log.finished_at = datetime.utcnow()
-                    session.add(log)
-                    await session.commit()
-
-                    print(
-                        f"[{channel_username}] Done! Parsed: {channel_parsed}, "
-                        f"New: {channel_new}"
-                    )
-
+                    parsed, new = await self.parse_channel(session, channel, history=history)
+                    total_parsed += parsed
+                    total_new += new
+                    log.posts_parsed = parsed
+                    log.posts_new = new
                 except Exception as e:
-                    log.error_message = f"[{channel_username}] {str(e)}"
-                    log.finished_at = datetime.utcnow()
+                    log.error_message = f"[{channel.username}] {str(e)}"
+                    print(f"ERROR parsing {channel.username}: {e}")
+                    # Прерывание бэкфилла НЕ снимает флаг — докачаем с места обрыва
+                finally:
                     log.duration_ms = int((time.time() - start_time) * 1000)
+                    log.finished_at = datetime.utcnow()
                     session.add(log)
                     await session.commit()
-                    print(f"ERROR parsing {channel_username}: {e}")
-                    # Continue to next channel instead of failing everything
-                    continue
+                    print(f"[{channel.username}] Done! Parsed: {parsed}, New: {new}")
 
         print(
             f"\n{'='*50}\n"
@@ -349,7 +306,7 @@ class MarketTwitsParser:
         me = await self.client.get_me()
         print(f"Connected as {me.first_name} (@{me.username})")
         try:
-            await self.parse(limit=LIMIT, history=HISTORY)
+            await self.parse(history=HISTORY)
         finally:
             await self.client.disconnect()
 
@@ -365,7 +322,7 @@ class MarketTwitsParser:
             while True:
                 print(f"\n[{datetime.utcnow().isoformat()}] Starting parse...")
                 try:
-                    await self.parse(limit=None, history=False)
+                    await self.parse(history=False)
                 except Exception as e:
                     print(f"Parse error: {e}")
                 print(f"Sleeping {INTERVAL_SEC}s...")
