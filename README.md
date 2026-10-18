@@ -7,6 +7,7 @@ Parser for @markettwits Telegram channel. Saves posts to PostgreSQL with full ha
 v2 (репозиторий `tgparser_20`) разворачивается **параллельно v1**: старый `tgparser`
 продолжает работать, пока v2 не принят. Изоляция по всем осям — репо, Render-сервисы,
 база данных, TG-сессия. План внедрения и критерии приёмки: ТЗ-tgparser-01.
+**Пошаговая инструкция по развёртыванию: [DEPLOY-v2.md](DEPLOY-v2.md).**
 
 **Что нового в 2.0:**
 
