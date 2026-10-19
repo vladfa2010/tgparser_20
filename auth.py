@@ -161,6 +161,9 @@ async def login(body: LoginBody, request: Request, response: Response):
     if not ok or not stored_hash:
         return JSONResponse({"error": "Неверный логин или пароль"}, status_code=401)
 
+    # Успешная аутентификация — обнуляем счётчик неудачных попыток для этого IP
+    _attempts.pop(ip, None)
+
     token = _issue_token(username, sv)
     response.set_cookie(
         COOKIE_NAME, token, max_age=TOKEN_TTL_DAYS * 86400,

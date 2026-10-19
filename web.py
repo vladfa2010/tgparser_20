@@ -117,6 +117,27 @@ PUBLIC_PATHS = ("/rss", "/rss/news", "/rss/analytics", "/login", "/api/auth/logi
 
 
 @app.middleware("http")
+async def security_headers(request, call_next):
+    """Базовые security-заголовки на все ответы (OWASP Secure Headers Project).
+    script-src разрешает cdn.jsdelivr.net — оттуда страницы графиков грузят ECharts."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self'; "
+        "font-src 'self' data:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'"
+    )
+    return response
+
+
+@app.middleware("http")
 async def auth_guard(request, call_next):
     path = request.url.path
     if path in PUBLIC_PATHS or path.startswith("/rss/"):
@@ -2019,7 +2040,7 @@ async def rss_feed(
             )
     except Exception as e:
         logger.error(f"/rss error: {e}"); traceback.print_exc()
-        return json_response({"error": str(e)}, 500)
+        return json_response({"error": "internal error"}, 500)  # детали — только в логах
 
 
 # ─── RSS потоки по типу: новости / аналитика ─────────────────
@@ -2084,7 +2105,7 @@ async def _typed_rss(feed_type: str, limit: int):
             )
     except Exception as e:
         logger.error(f"/rss/{feed_type} error: {e}"); traceback.print_exc()
-        return json_response({"error": str(e)}, 500)
+        return json_response({"error": "internal error"}, 500)
 
 
 @app.get("/rss/news")
@@ -2134,7 +2155,7 @@ async def rss_opml(request: Request):
         )
     except Exception as e:
         logger.error(f"/rss/opml error: {e}"); traceback.print_exc()
-        return json_response({"error": str(e)}, 500)
+        return json_response({"error": "internal error"}, 500)
 
 
 
@@ -2171,7 +2192,7 @@ async def rss_channel(username: str, limit: int = Query(50, ge=1, le=200)):
             )
     except Exception as e:
         logger.error(f"/rss/{username} error: {e}"); traceback.print_exc()
-        return json_response({"error": str(e)}, 500)
+        return json_response({"error": "internal error"}, 500)
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────

@@ -63,6 +63,25 @@ async def main():
         r = await client.get("/health")
         check("C17 /health 200 + version=2.0.0", r.status_code == 200 and r.json().get("version") == "2.0.0", r.text[:80])
 
+        # Аудит ИБ: security-заголовки на всех ответах
+        h = r.headers
+        check("ИБ: security-заголовки (nosniff, frame, referrer, CSP)",
+              h.get("x-content-type-options") == "nosniff"
+              and h.get("x-frame-options") == "DENY"
+              and "cdn.jsdelivr.net" in h.get("content-security-policy", "")
+              and "frame-ancestors 'none'" in h.get("content-security-policy", ""),
+              str({k: h.get(k) for k in ("x-content-type-options", "x-frame-options")}))
+
+        # Замечание 3: успешный логин обнуляет счётчик rate limit
+        for i in range(13):
+            await client.post("/api/auth/login", json={"username": "admin", "password": "x"})
+        await client.post("/api/auth/login", json={"username": "admin", "password": "test_password_123"})
+        code = (await client.post("/api/auth/login", json={"username": "admin", "password": "x"})).status_code
+        check("ИБ: после успешного логина счётчик сброшен (1-я неудача = 401, не 429)",
+              code == 401, str(code))
+        auth._attempts.clear()
+        await client.post("/api/auth/logout")  # дальнейшие проверки — с чистой сессией
+
         r = await client.get("/")
         check("C3 GET / → redirect /login", r.status_code in (301, 302, 307) and "/login" in r.headers.get("location", ""), str(r.status_code))
         r = await client.get("/admin")
