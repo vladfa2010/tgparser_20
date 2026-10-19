@@ -11,7 +11,7 @@ import io
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select, text
 
@@ -2094,6 +2094,82 @@ async def rss_news(limit: int = Query(50, ge=1, le=200)):
 @app.get("/rss/analytics")
 async def rss_analytics(limit: int = Query(50, ge=1, le=200)):
     return await _typed_rss("analytics", limit)
+
+
+@app.get("/rss/opml")
+async def rss_opml(request: Request):
+    """Все фиды одним OPML-файлом: импорт в Пульс/ридер пачкой вместо ручного вбивания URL."""
+    try:
+        from email.utils import format_datetime
+        base = str(request.base_url).rstrip("/")
+
+        def esc(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+
+        outlines = []
+        for feed_type, label in (("news", "Поток «Новости»"), ("analytics", "Поток «Аналитика»")):
+            outlines.append(
+                f'<outline text="{esc(label)}" type="rss" xmlUrl="{base}/rss/{feed_type}"/>')
+        async with async_session() as session:
+            rows = (await session.execute(
+                text("SELECT username, title FROM channels WHERE is_active ORDER BY username")
+            )).all()
+            for username, title in rows:
+                label = title or ("@" + username)
+                outlines.append(
+                    f'<outline text="{esc(label)}" type="rss" xmlUrl="{base}/rss/{username}"/>')
+
+        opml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+<head><title>TG Parser — фиды</title><dateCreated>{format_datetime(datetime.now())}</dateCreated></head>
+<body>
+{chr(10).join(outlines)}
+</body>
+</opml>"""
+        return HTMLResponse(
+            content=opml,
+            media_type="text/x-opml; charset=utf-8",
+            headers={"Cache-Control": "max-age=300, public"}
+        )
+    except Exception as e:
+        logger.error(f"/rss/opml error: {e}"); traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
+
+
+
+# Регистрируется ПОСЛЕ /rss/news и /rss/analytics: литеральные маршруты выигрывают,
+# а /rss/{username} отдаёт отдельный фид на каждый канал (гибкость: подписка
+# в Пульсе на один канал, свои папки из каналов разных потоков и т.п.).
+@app.get("/rss/{username}")
+async def rss_channel(username: str, limit: int = Query(50, ge=1, le=200)):
+    try:
+        u = username.strip().lstrip("@").lower()
+        async with async_session() as session:
+            ch = (await session.execute(
+                text("SELECT username, title FROM channels WHERE username = :u AND is_active"),
+                {"u": u})).first()
+            if not ch:
+                return json_response({"error": f"channel @{u} not found"}, 404)
+            ch_username, ch_title = ch[0], ch[1] or ch[0]
+            result = await session.execute(text("""
+                SELECT p.telegram_message_id, p.text, p.published_at,
+                       c.username, c.title
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE c.username = :u AND c.is_active
+                ORDER BY p.published_at DESC
+                LIMIT :limit
+            """), {"u": u, "limit": limit})
+            rss = _rss_xml(result.fetchall(), ch_title, f"https://t.me/{ch_username}",
+                           f"Лента канала @{ch_username}")
+            return HTMLResponse(
+                content=rss,
+                media_type="application/rss+xml; charset=utf-8",
+                headers={"Cache-Control": "max-age=300, public"}
+            )
+    except Exception as e:
+        logger.error(f"/rss/{username} error: {e}"); traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────
