@@ -39,6 +39,7 @@ class ChannelPatch(BaseModel):
     username: str | None = Field(default=None, min_length=1, max_length=255)
     feed_type: str | None = None
     is_active: bool | None = None
+    rss_title: str | None = Field(default=None, max_length=500)  # '' → сброс к названию из TG
 
 
 class FeedTitles(BaseModel):
@@ -53,7 +54,7 @@ async def list_channels():
         rows = (await session.execute(
             text("""
                 SELECT c.id, c.username, c.title, c.feed_type, c.is_active,
-                       c.backfill_full, c.subscriber_count, c.last_parsed_at,
+                       c.backfill_full, c.rss_title, c.subscriber_count, c.last_parsed_at,
                        (SELECT count(*) FROM posts p WHERE p.channel_id = c.id) AS post_count,
                        (SELECT max(p.published_at) FROM posts p WHERE p.channel_id = c.id) AS last_post_at,
                        (SELECT pl.error_message FROM parse_logs pl
@@ -109,6 +110,8 @@ async def patch_channel(channel_id: int, body: ChannelPatch):
             channel.feed_type = body.feed_type or None
         if body.is_active is not None:
             channel.is_active = body.is_active
+        if body.rss_title is not None:
+            channel.rss_title = body.rss_title.strip() or None
         await session.commit()
     return {"ok": True}
 
@@ -221,7 +224,7 @@ a.feedlink:hover{text-decoration:underline}
 </div>
 <div class="msg" id="msg1"></div>
 <table><thead><tr>
-<th>@username</th><th>Название</th><th>Постов</th><th>Последний пост</th><th>Прогон / ошибка</th><th>Поток</th><th>Активен</th><th>Фид</th><th>Действия</th>
+<th>@username</th><th>Название</th><th>Название в RSS</th><th>Постов</th><th>Последний пост</th><th>Прогон / ошибка</th><th>Поток</th><th>Активен</th><th>Фид</th><th>Действия</th>
 </tr></thead><tbody id="rows"></tbody></table>
 
 <h2>Названия RSS-потоков</h2>
@@ -255,6 +258,8 @@ async function api(method, url, body){
 async function load(){
   var d = await api('GET','/api/admin/channels');
   document.getElementById('rows').innerHTML = d.channels.map(function(c){
+    var rssInput = '<input size="18" placeholder="как в TG" value="'+esc(c.rss_title||'')+'" '
+      + 'onchange="patch('+c.id+',{rss_title:this.value})">';
     var feedSel = '<select onchange="patch('+c.id+',{feed_type:this.value})">'
       + '<option value=""'+(c.feed_type?'':' selected')+'>—</option>'
       + '<option value="news"'+(c.feed_type==='news'?' selected':'')+'>Новости</option>'
@@ -265,6 +270,7 @@ async function load(){
     return '<tr class="'+(c.is_active?'':'off')+'">'
       + '<td>@'+esc(c.username)+'</td>'
       + '<td>'+esc(c.title||'')+'</td>'
+      + '<td>'+rssInput+'</td>'
       + '<td>'+(c.post_count||0)+'</td>'
       + '<td>'+last+'</td>'
       + '<td>'+run+err+'</td>'

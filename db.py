@@ -41,6 +41,7 @@ class Channel(Base):
     is_active = Column(Boolean, default=True)
     feed_type = Column(String(20), nullable=True)      # 'news' | 'analytics' | NULL
     backfill_full = Column(Boolean, default=False)     # «докачать всю историю»
+    rss_title = Column(String(500), nullable=True)     # кастомное название в RSS (приоритет над title из TG)
     last_parsed_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
 
@@ -91,6 +92,7 @@ class Settings(Base):
 MIGRATION_DDL = [
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS feed_type VARCHAR(20)",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS backfill_full BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS rss_title VARCHAR(500)",
     """
     CREATE TABLE IF NOT EXISTS settings (
         key VARCHAR(100) PRIMARY KEY,

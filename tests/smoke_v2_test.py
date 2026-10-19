@@ -117,6 +117,22 @@ async def main():
               and "Новость: рост рынка" in r.text and "Аналитика: цель" not in r.text, str(r.status_code))
         r = await client.get("/rss/@testnews")
         check("/rss/@username (с @) тоже работает", r.status_code == 200, str(r.status_code))
+
+        # Кастомное название в RSS: приоритет над TG-названием, сброс пустым
+        r = await client.patch(f"/api/admin/channels/{ids['testanalytics']}",
+                               json={"rss_title": "Лучшая аналитика рынка"})
+        r2 = await client.get("/rss/testanalytics")
+        ok_custom = (r.status_code == 200 and "<title>Лучшая аналитика рынка</title>" in r2.text)
+        await client.patch(f"/api/admin/channels/{ids['testanalytics']}", json={"rss_title": ""})
+        r3 = await client.get("/rss/testanalytics")
+        ok_reset = ("<title>Тестовая Аналитика</title>" in r3.text)
+        await client.patch(f"/api/admin/channels/{ids['testanalytics']}",
+                           json={"rss_title": "Кастом 2"})
+        r4 = await client.get("/rss/opml")
+        ok_opml = ("Кастом 2" in r4.text)
+        check("Название в RSS: кастом → приоритет, пусто → сброс к TG, OPML синхронен",
+              ok_custom and ok_reset and ok_opml,
+              f"custom={ok_custom} reset={ok_reset} opml={ok_opml}")
         r = await client.get("/rss/no_such_channel")
         check("/rss/{username}: несуществующий канал → 404", r.status_code == 404, str(r.status_code))
         r = await client.get("/rss/opml")

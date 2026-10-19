@@ -2113,10 +2113,10 @@ async def rss_opml(request: Request):
                 f'<outline text="{esc(label)}" type="rss" xmlUrl="{base}/rss/{feed_type}"/>')
         async with async_session() as session:
             rows = (await session.execute(
-                text("SELECT username, title FROM channels WHERE is_active ORDER BY username")
+                text("SELECT username, title, rss_title FROM channels WHERE is_active ORDER BY username")
             )).all()
-            for username, title in rows:
-                label = title or ("@" + username)
+            for username, title, rss_title in rows:
+                label = rss_title or title or ("@" + username)
                 outlines.append(
                     f'<outline text="{esc(label)}" type="rss" xmlUrl="{base}/rss/{username}"/>')
 
@@ -2147,11 +2147,12 @@ async def rss_channel(username: str, limit: int = Query(50, ge=1, le=200)):
         u = username.strip().lstrip("@").lower()
         async with async_session() as session:
             ch = (await session.execute(
-                text("SELECT username, title FROM channels WHERE username = :u AND is_active"),
+                text("SELECT username, title, rss_title FROM channels WHERE username = :u AND is_active"),
                 {"u": u})).first()
             if not ch:
                 return json_response({"error": f"channel @{u} not found"}, 404)
-            ch_username, ch_title = ch[0], ch[1] or ch[0]
+            ch_username = ch[0]
+            ch_title = ch[2] or ch[1] or ch_username  # кастомное название из админки приоритетнее TG
             result = await session.execute(text("""
                 SELECT p.telegram_message_id, p.text, p.published_at,
                        c.username, c.title
