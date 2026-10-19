@@ -65,6 +65,8 @@ async def main():
 
         r = await client.get("/")
         check("C3 GET / → redirect /login", r.status_code in (301, 302, 307) and "/login" in r.headers.get("location", ""), str(r.status_code))
+        r = await client.get("/admin")
+        check("C3 GET /admin без логина → redirect /login", r.status_code in (301, 302, 307) and "/login" in r.headers.get("location", ""), str(r.status_code))
 
         r = await client.get("/api/posts")
         check("C3 GET /api/posts без cookie → 401", r.status_code == 401, str(r.status_code))
@@ -87,6 +89,12 @@ async def main():
 
         r = await client.get("/api/admin/channels")
         check("C4 /api/admin/channels → 200", r.status_code == 200 and len(r.json()["channels"]) == 3, str(r.status_code))
+
+        r = await client.get("/admin")
+        ok_admin_page = (r.status_code == 200 and "Админка: каналы" in r.text
+                         and 'href="/admin" class="on"' in r.text
+                         and 'href="/charts"' in r.text and "Каналы" in r.text)
+        check("Вкладка /admin: навигация дашборда + каналы и опции", ok_admin_page, str(r.status_code))
 
         r = await client.post("/api/admin/channels", json={"username": "https://t.me/NewChannel", "feed_type": "news"})
         check("C5/C6 добавление канала → 201", r.status_code == 201 and r.json()["username"] == "newchannel", r.text[:120])

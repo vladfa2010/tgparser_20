@@ -246,6 +246,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <a href="/sectors">&#127775; Sectors</a>
 <a href="/wordcloud">&#9729;&#65039; Words</a>
 <a href="/crossmarket">&#127758; Macro</a>
+<a href="/admin">&#9881;&#65039; Admin</a>
 </nav>
 
 <section id="tab-posts">

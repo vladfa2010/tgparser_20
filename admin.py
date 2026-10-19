@@ -159,60 +159,89 @@ async def put_settings(body: FeedTitles):
 
 # ─── Page ────────────────────────────────────────────────────
 ADMIN_HTML = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8">
+<html lang="ru">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Админка — TG Parser</title>
+<title>Admin — TG Parser Dashboard</title>
 <style>
-body{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,-apple-system,sans-serif;padding:24px}
-h1{font-size:20px;margin:0 0 16px}
-h2{font-size:16px;margin:28px 0 10px;color:#94a3b8}
-a{color:#60a5fa;text-decoration:none;font-size:13px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:8px 10px;border-bottom:1px solid #1e293b;text-align:left;vertical-align:middle}
-th{color:#64748b;font-weight:600}
-select,input{background:#1e293b;border:1px solid #475569;border-radius:6px;color:#e2e8f0;padding:6px 8px;font-size:13px}
-button{background:#2563eb;border:none;border-radius:6px;color:#fff;padding:6px 12px;font-size:13px;cursor:pointer}
-button:hover{background:#1d4ed8}
-button.danger{background:#b91c1c}button.danger:hover{background:#991b1b}
-button.ghost{background:#334155}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
+.wrap{max-width:1200px;margin:0 auto;padding:24px}
+header{margin-bottom:24px}h1{color:#00d4aa;font-size:28px;font-weight:700}
+.sub{color:#64748b;font-size:14px;margin-top:4px}
+nav{display:flex;gap:4px;background:#0f172a;padding:4px;border-radius:10px;border:1px solid #1e293b;width:fit-content;margin-bottom:24px;flex-wrap:wrap}
+nav a{color:#64748b;text-decoration:none;padding:10px 20px;border-radius:8px;font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px}
+nav a:hover{color:#e2e8f0;background:#1e293b}
+nav a.on{color:#0a0a1a;background:#00d4aa;font-weight:600}
+h2{color:#e2e8f0;font-size:18px;margin:28px 0 12px}
+.muted{color:#64748b;font-size:13px}
+.msg{min-height:18px;font-size:13px;margin:8px 0}
+.err{color:#f87171}.ok{color:#00d4aa}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-.err{color:#f87171}.ok{color:#4ade80}.muted{color:#64748b}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
-.badge.news{background:#1e3a8a}.badge.analytics{background:#5b21b6}
-.off{opacity:.5}
-.msg{min-height:18px;font-size:13px;margin:6px 0}
-</style></head><body>
-<h1>TG Parser 2.0 — админка <span class="muted">·</span> <a href="/">← Дашборд</a>
-<span class="muted">·</span> <a href="#" id="logout">Выйти</a></h1>
+.row input,.row select{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:14px;outline:none}
+.row input:focus,.row select:focus{border-color:#00d4aa}
+.btn{background:#00d4aa;color:#0a0a1a;border:none;padding:10px 20px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.btn:hover{opacity:.85}
+.btn.sm{padding:6px 12px;font-size:13px}
+.btn.ghost{background:#1e293b;color:#e2e8f0}
+.btn.danger{background:#7f1d1d;color:#f87171}
+table{width:100%;border-collapse:separate;border-spacing:0;background:#0f172a;border:1px solid #1e293b;border-radius:12px;overflow:hidden;font-size:13px}
+th{background:#131a2e;color:#64748b;font-weight:600;text-align:left;padding:10px 12px}
+td{padding:10px 12px;border-top:1px solid #1e293b;vertical-align:middle}
+tr.off{opacity:.45}
+td select{background:#0a0a1a;border:1px solid #1e293b;color:#e2e8f0;padding:5px 8px;border-radius:6px;font-size:13px}
+.chip{display:inline-block;background:#1e293b;color:#00d4aa;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
+a.feedlink{color:#60a5fa;text-decoration:none;font-size:12px}
+a.feedlink:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><h1>TG Parser Dashboard</h1><p class="sub">Админка: каналы, RSS-потоки, доступ</p></header>
+<nav>
+<a href="/">&#128240; Posts</a>
+<a href="/charts">&#128202; Charts</a>
+<a href="/analytics">&#128270; Analytics</a>
+<a href="/tag-daily">&#128200; Stock</a>
+<a href="/sentiment">&#129504; Sentiment</a>
+<a href="/viral">&#128293; Viral</a>
+<a href="/sectors">&#127775; Sectors</a>
+<a href="/wordcloud">&#9729;&#65039; Words</a>
+<a href="/crossmarket">&#127758; Macro</a>
+<a href="/admin" class="on">&#9881;&#65039; Admin</a>
+</nav>
 
 <h2>Каналы</h2>
 <div class="row">
-<input id="new-username" placeholder="@channel или ссылка t.me/..." size="30">
+<input id="new-username" placeholder="@channel или ссылка t.me/..." size="32">
 <select id="new-feed"><option value="">— без потока</option><option value="news">Новости</option><option value="analytics">Аналитика</option></select>
-<button id="add">Добавить</button>
-<span class="muted">первичная докачка — 2000 последних постов</span>
+<button class="btn" id="add">Добавить</button>
+<span class="muted">первичная докачка — 2000 последних постов; изменения подхватывает крон за 5 минут</span>
 </div>
 <div class="msg" id="msg1"></div>
 <table><thead><tr>
-<th>@username</th><th>Название</th><th>Постов</th><th>Последний пост</th><th>Прогон</th><th>Поток</th><th>Активен</th><th>Действия</th>
+<th>@username</th><th>Название</th><th>Постов</th><th>Последний пост</th><th>Прогон / ошибка</th><th>Поток</th><th>Активен</th><th>Фид</th><th>Действия</th>
 </tr></thead><tbody id="rows"></tbody></table>
 
 <h2>Названия RSS-потоков</h2>
 <div class="row">
 <input id="t-news" placeholder="Новости" size="30">
 <input id="t-analytics" placeholder="Аналитика" size="30">
-<button id="save-titles">Сохранить</button>
+<button class="btn" id="save-titles">Сохранить</button>
 </div>
 <div class="msg" id="msg2"></div>
 <p class="muted" id="feed-urls"></p>
 
-<h2>Смена пароля</h2>
+<h2>Доступ</h2>
 <div class="row">
 <input id="cur-pwd" type="password" placeholder="Текущий пароль">
 <input id="new-pwd" type="password" placeholder="Новый (мин. 8 символов)">
-<button id="save-pwd">Сменить</button>
+<button class="btn" id="save-pwd">Сменить пароль</button>
+<button class="btn ghost" id="logout">Выйти</button>
 </div>
 <div class="msg" id="msg3"></div>
+</div>
 
 <script>
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
@@ -230,23 +259,26 @@ async function load(){
       + '<option value=""'+(c.feed_type?'':' selected')+'>—</option>'
       + '<option value="news"'+(c.feed_type==='news'?' selected':'')+'>Новости</option>'
       + '<option value="analytics"'+(c.feed_type==='analytics'?' selected':'')+'>Аналитика</option></select>';
-    var err = c.last_error ? '<div class="err" title="'+esc(c.last_error)+'">'+esc(c.last_error.slice(0,60))+'</div>' : '';
+    var err = c.last_error ? '<div class="err" title="'+esc(c.last_error)+'">&#9888;&#65039; '+esc(c.last_error.slice(0,50))+'</div>' : '';
+    var run = c.last_run_at ? esc(c.last_run_at.slice(0,16).replace('T',' ')) : '—';
+    var last = c.last_post_at ? esc(c.last_post_at.slice(0,16).replace('T',' ')) : '—';
     return '<tr class="'+(c.is_active?'':'off')+'">'
-      + '<td>@{0}</td>'.replace('{0}', esc(c.username))
+      + '<td>@'+esc(c.username)+'</td>'
       + '<td>'+esc(c.title||'')+'</td>'
       + '<td>'+(c.post_count||0)+'</td>'
-      + '<td>'+(c.last_post_at?esc(c.last_post_at.slice(0,16).replace('T',' ')):'—')+'</td>'
-      + '<td>'+(c.last_run_at?esc(c.last_run_at.slice(0,16).replace('T',' ')):'—')+err+'</td>'
+      + '<td>'+last+'</td>'
+      + '<td>'+run+err+'</td>'
       + '<td>'+feedSel+'</td>'
-      + '<td><button class="ghost" onclick="patch('+c.id+',{is_active:'+(!c.is_active)+'})">'+(c.is_active?'выкл':'вкл')+'</button></td>'
-      + '<td><button class="ghost" onclick="backfill('+c.id+')">Докачать всё</button> '
-      + '<button class="danger" onclick="del('+c.id+",'"+esc(c.username)+"')\">Удалить</button></td></tr>";
+      + '<td><button class="btn sm ghost" onclick="patch('+c.id+',{is_active:'+(!c.is_active)+'})">'+(c.is_active?'выкл':'вкл')+'</button></td>'
+      + '<td><a class="feedlink" href="/rss/'+esc(c.username)+'" target="_blank">RSS</a></td>'
+      + '<td><button class="btn sm ghost" onclick="backfill('+c.id+')">Докачать всё</button> '
+      + '<button class="btn sm danger" onclick="del('+c.id+",'"+esc(c.username)+"')">Удалить</button></td></tr>";
   }).join('');
   var s = await api('GET','/api/admin/settings');
   document.getElementById('t-news').value = s.rss_news_title || '';
   document.getElementById('t-analytics').value = s.rss_analytics_title || '';
   document.getElementById('feed-urls').textContent =
-    'Фиды: /rss/news ('+(s.rss_news_title||'Новости')+') и /rss/analytics ('+(s.rss_analytics_title||'Аналитика')+')';
+    'Фиды: /rss/news («'+(s.rss_news_title||'Новости')+'») · /rss/analytics («'+(s.rss_analytics_title||'Аналитика')+'») · /rss/{username} на каждый канал · /rss/opml — всё одним файлом';
 }
 async function patch(id, body){ try{ await api('PATCH','/api/admin/channels/'+id, body); load(); }catch(e){ alert(e.message); } }
 async function backfill(id){ try{ var d = await api('POST','/api/admin/channels/'+id+'/backfill'); alert(d.note); }catch(e){ alert(e.message); } }
@@ -256,31 +288,29 @@ document.getElementById('add').onclick = async function(){
   try{ var d = await api('POST','/api/admin/channels',
     {username:document.getElementById('new-username').value,
      feed_type:document.getElementById('new-feed').value || null});
-    document.getElementById('msg1').textContent = d.note; document.getElementById('msg1').className='msg ok';
+    var m=document.getElementById('msg1'); m.textContent = d.note; m.className='msg ok';
     document.getElementById('new-username').value=''; load();
-  }catch(e){ document.getElementById('msg1').textContent = e.message; document.getElementById('msg1').className='msg err'; }
+  }catch(e){ var m=document.getElementById('msg1'); m.textContent = e.message; m.className='msg err'; }
 };
 document.getElementById('save-titles').onclick = async function(){
   try{ await api('PUT','/api/admin/settings',
     {rss_news_title:document.getElementById('t-news').value,
      rss_analytics_title:document.getElementById('t-analytics').value});
-    document.getElementById('msg2').textContent='Сохранено'; document.getElementById('msg2').className='msg ok'; load();
-  }catch(e){ document.getElementById('msg2').textContent=e.message; document.getElementById('msg2').className='msg err'; }
+    var m=document.getElementById('msg2'); m.textContent='Сохранено'; m.className='msg ok'; load();
+  }catch(e){ var m=document.getElementById('msg2'); m.textContent=e.message; m.className='msg err'; }
 };
 document.getElementById('save-pwd').onclick = async function(){
   try{ await api('POST','/api/auth/change-password',
     {current:document.getElementById('cur-pwd').value, new:document.getElementById('new-pwd').value});
-    document.getElementById('msg3').textContent='Пароль сменён, сессии обновлены';
-    document.getElementById('msg3').className='msg ok';
+    var m=document.getElementById('msg3'); m.textContent='Пароль сменён, все сессии завершены'; m.className='msg ok';
     document.getElementById('cur-pwd').value=''; document.getElementById('new-pwd').value='';
-  }catch(e){ document.getElementById('msg3').textContent=e.message; document.getElementById('msg3').className='msg err'; }
+  }catch(e){ var m=document.getElementById('msg3'); m.textContent=e.message; m.className='msg err'; }
 };
-document.getElementById('logout').onclick = async function(e){
-  e.preventDefault(); await api('POST','/api/auth/logout'); location.href='/login';
-};
+document.getElementById('logout').onclick = async function(){ await api('POST','/api/auth/logout'); location.href='/login'; };
 load();
 </script>
-</body></html>"""
+</body>
+</html>"""
 
 
 @router.get("/admin", response_class=HTMLResponse)
