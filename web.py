@@ -17,6 +17,7 @@ from sqlalchemy import func, select, text
 
 import admin
 import auth
+import rsscache
 from db import ParseLog, Post, async_session, ensure_schema, get_setting
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1954,6 +1955,10 @@ async def rss_feed(
     limit: int = Query(50, ge=1, le=200),
     channel: str = Query("", description="Filter by channel username(s), comma-separated"),
 ):
+    return await rsscache.get(f"/rss:{channel}:{limit}", lambda: _rss_feed_impl(limit, channel))
+
+
+async def _rss_feed_impl(limit: int, channel: str):
     try:
         from email.utils import format_datetime
 
@@ -2110,17 +2115,21 @@ async def _typed_rss(feed_type: str, limit: int):
 
 @app.get("/rss/news")
 async def rss_news(limit: int = Query(50, ge=1, le=200)):
-    return await _typed_rss("news", limit)
+    return await rsscache.get(f"/rss/news:{limit}", lambda: _typed_rss("news", limit))
 
 
 @app.get("/rss/analytics")
 async def rss_analytics(limit: int = Query(50, ge=1, le=200)):
-    return await _typed_rss("analytics", limit)
+    return await rsscache.get(f"/rss/analytics:{limit}", lambda: _typed_rss("analytics", limit))
 
 
 @app.get("/rss/opml")
 async def rss_opml(request: Request):
     """Все фиды одним OPML-файлом: импорт в Пульс/ридер пачкой вместо ручного вбивания URL."""
+    return await rsscache.get("/rss/opml", lambda: _rss_opml_impl(request))
+
+
+async def _rss_opml_impl(request: Request):
     try:
         from email.utils import format_datetime
         base = str(request.base_url).rstrip("/")
@@ -2164,6 +2173,10 @@ async def rss_opml(request: Request):
 # в Пульсе на один канал, свои папки из каналов разных потоков и т.п.).
 @app.get("/rss/{username}")
 async def rss_channel(username: str, limit: int = Query(50, ge=1, le=200)):
+    return await rsscache.get(f"/rss/{username}:{limit}", lambda: _rss_channel_impl(username, limit))
+
+
+async def _rss_channel_impl(username: str, limit: int):
     try:
         u = username.strip().lstrip("@").lower()
         async with async_session() as session:

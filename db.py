@@ -93,6 +93,8 @@ MIGRATION_DDL = [
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS feed_type VARCHAR(20)",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS backfill_full BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS rss_title VARCHAR(500)",
+    "CREATE INDEX IF NOT EXISTS ix_posts_published_at ON posts (published_at DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_posts_channel_pub ON posts (channel_id, published_at DESC)",
     """
     CREATE TABLE IF NOT EXISTS settings (
         key VARCHAR(100) PRIMARY KEY,

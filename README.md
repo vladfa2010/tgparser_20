@@ -174,7 +174,11 @@ parse_logs   — parsing history (posts count, duration, errors)
 | `/rss/opml` | файл-оглавление всех фидов | — |
 | `/rss` | все каналы (как в v1) | как в v1 |
 
-Проверка: `tests/smoke_v2_test.py` — 29 end-to-end проверок по критериям ТЗ-tgparser-01.
+Все фиды кешируются в памяти на 120 с (снижает нагрузку на БД от поллинга ридеров);
+правки в админке сбрасывают кеш мгновенно, свежие посты появляются в фидах не позднее TTL.
+Под сортировку фидов созданы индексы `posts(published_at DESC)` и `(channel_id, published_at DESC)`.
+
+Проверка: `tests/smoke_v2_test.py` — 31 end-to-end проверка по критериям ТЗ-tgparser-01.
 
 ## Files
 

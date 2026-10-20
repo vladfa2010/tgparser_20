@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 
+import rsscache
 from auth import require_admin
 from db import Channel, ParseLog, Post, async_session, get_setting, set_setting
 
@@ -83,6 +84,7 @@ async def create_channel(body: ChannelCreate):
         session.add(Channel(username=username, is_active=True, feed_type=feed,
                             title="@" + username))
         await session.commit()
+    rsscache.invalidate()
     return {"ok": True, "username": username,
             "note": "Канал подхватится парсером на ближайшем прогоне крона (первичная докачка — 2000 последних постов)"}
 
@@ -113,6 +115,7 @@ async def patch_channel(channel_id: int, body: ChannelPatch):
         if body.rss_title is not None:
             channel.rss_title = body.rss_title.strip() or None
         await session.commit()
+    rsscache.invalidate()
     return {"ok": True}
 
 
@@ -125,6 +128,7 @@ async def delete_channel(channel_id: int):
             raise HTTPException(404, "Канал не найден")
         await session.delete(channel)
         await session.commit()
+    rsscache.invalidate()
     return {"ok": True}
 
 
@@ -137,6 +141,7 @@ async def request_backfill(channel_id: int):
             raise HTTPException(404, "Канал не найден")
         channel.backfill_full = True
         await session.commit()
+    rsscache.invalidate()
     return {"ok": True, "note": "Полная докачка запустится на ближайшем прогоне крона"}
 
 
@@ -157,6 +162,7 @@ async def put_settings(body: FeedTitles):
         if body.rss_analytics_title is not None:
             await set_setting(session, "rss_analytics_title", body.rss_analytics_title)
         await session.commit()
+    rsscache.invalidate()
     return {"ok": True}
 
 
