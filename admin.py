@@ -2,24 +2,27 @@
 """
 TG Parser v2 — Admin panel.
 
-Channel management lives in the DB now (not env): the parser picks up
-changes on its next cron run. Feeds are grouped via channels.feed_type
-('news' | 'analytics').
+Channel management lives in the DB (not env): the parser picks up
+changes on its next cron run. Channels are grouped via feed_groups —
+each group is its own RSS feed /rss/{slug}.
 """
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 
 import rsscache
 from auth import require_admin
-from db import Channel, ParseLog, Post, async_session, get_setting, set_setting
+from db import Channel, FeedGroup, ParseLog, Post, async_session
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
 VALID_FEED_TYPES = (None, "", "news", "analytics")
+
+SLUG_RE = re.compile(r"[^a-z0-9а-яё\-]+")
+SLUG_DASHES = re.compile(r"-+")
 
 
 def normalize_username(raw: str) -> str:
@@ -30,34 +33,46 @@ def normalize_username(raw: str) -> str:
     return u.lower()
 
 
+def normalize_slug(raw: str) -> str:
+    """«Мои новости» → «мои-новости». Пустой результат → ''."""
+    s = SLUG_RE.sub("-", raw.strip().lower().replace(" ", "-"))
+    return SLUG_DASHES.sub("-", s).strip("-")
+
+
 # ─── Schemas ─────────────────────────────────────────────────
 class ChannelCreate(BaseModel):
     username: str = Field(min_length=1, max_length=255)
-    feed_type: str | None = None
+    feed_type: str | None = None  # legacy, игнорируется — канал добавляется без группы
 
 
 class ChannelPatch(BaseModel):
     username: str | None = Field(default=None, min_length=1, max_length=255)
-    feed_type: str | None = None
+    group_id: int | None = None   # null → не менять; 0 → убрать из группы
     is_active: bool | None = None
     rss_title: str | None = Field(default=None, max_length=500)  # '' → сброс к названию из TG
 
 
-class FeedTitles(BaseModel):
-    rss_news_title: str | None = Field(default=None, max_length=300)
-    rss_analytics_title: str | None = Field(default=None, max_length=300)
+class GroupCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    slug: str | None = Field(default=None, max_length=200)
 
 
-# ─── API ─────────────────────────────────────────────────────
+class GroupPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    slug: str | None = Field(default=None, max_length=200)
+
+
+# ─── Channels API ────────────────────────────────────────────
 @router.get("/api/admin/channels")
 async def list_channels():
     async with async_session() as session:
         rows = (await session.execute(
             text("""
-                SELECT c.id, c.username, c.title, c.feed_type, c.is_active,
+                SELECT c.id, c.username, c.title, c.group_id, c.is_active,
                        c.backfill_full, c.rss_title, c.subscriber_count, c.last_parsed_at,
                        (SELECT count(*) FROM posts p WHERE p.channel_id = c.id) AS post_count,
                        (SELECT max(p.published_at) FROM posts p WHERE p.channel_id = c.id) AS last_post_at,
+                       (SELECT g.title FROM feed_groups g WHERE g.id = c.group_id) AS group_title,
                        (SELECT pl.error_message FROM parse_logs pl
                          WHERE pl.channel_id = c.id AND pl.error_message IS NOT NULL
                          ORDER BY pl.finished_at DESC NULLS LAST LIMIT 1) AS last_error,
@@ -75,14 +90,12 @@ async def create_channel(body: ChannelCreate):
     username = normalize_username(body.username)
     if not username:
         raise HTTPException(400, "Пустой username")
-    feed = body.feed_type if body.feed_type in ("news", "analytics") else None
     async with async_session() as session:
         exists = (await session.execute(
             select(Channel).where(Channel.username == username))).scalar_one_or_none()
         if exists:
             raise HTTPException(409, f"Канал @{username} уже есть в списке")
-        session.add(Channel(username=username, is_active=True, feed_type=feed,
-                            title="@" + username))
+        session.add(Channel(username=username, is_active=True, title="@" + username))
         await session.commit()
     rsscache.invalidate()
     return {"ok": True, "username": username,
@@ -106,10 +119,14 @@ async def patch_channel(channel_id: int, body: ChannelPatch):
             if clash:
                 raise HTTPException(409, f"Имя @{username} занято другим каналом")
             channel.username = username
-        if body.feed_type is not None:
-            if body.feed_type not in VALID_FEED_TYPES:
-                raise HTTPException(400, "feed_type: news, analytics или пусто")
-            channel.feed_type = body.feed_type or None
+        if body.group_id is not None:
+            if body.group_id == 0:
+                channel.group_id = None
+            else:
+                group = await session.get(FeedGroup, body.group_id)
+                if not group:
+                    raise HTTPException(404, "Группа не найдена")
+                channel.group_id = group.id
         if body.is_active is not None:
             channel.is_active = body.is_active
         if body.rss_title is not None:
@@ -145,22 +162,72 @@ async def request_backfill(channel_id: int):
     return {"ok": True, "note": "Полная докачка запустится на ближайшем прогоне крона"}
 
 
-@router.get("/api/admin/settings")
-async def get_settings():
+# ─── Groups API (CRUD) ───────────────────────────────────────
+@router.get("/api/admin/groups")
+async def list_groups():
     async with async_session() as session:
-        return {
-            "rss_news_title": await get_setting(session, "rss_news_title", ""),
-            "rss_analytics_title": await get_setting(session, "rss_analytics_title", ""),
-        }
+        rows = (await session.execute(
+            text("""
+                SELECT g.id, g.slug, g.title,
+                       (SELECT count(*) FROM channels c WHERE c.group_id = g.id) AS channel_count
+                FROM feed_groups g
+                ORDER BY g.title
+            """)
+        )).mappings().all()
+        return {"groups": [dict(r) for r in rows]}
 
 
-@router.put("/api/admin/settings")
-async def put_settings(body: FeedTitles):
+@router.post("/api/admin/groups", status_code=201)
+async def create_group(body: GroupCreate):
+    title = body.title.strip()
+    slug = normalize_slug(body.slug or title)
+    if not slug:
+        raise HTTPException(400, "Не получилось сделать slug из названия — задайте slug явно (латиница/цифры/дефис)")
     async with async_session() as session:
-        if body.rss_news_title is not None:
-            await set_setting(session, "rss_news_title", body.rss_news_title)
-        if body.rss_analytics_title is not None:
-            await set_setting(session, "rss_analytics_title", body.rss_analytics_title)
+        clash = (await session.execute(
+            select(FeedGroup).where(FeedGroup.slug == slug))).scalar_one_or_none()
+        if clash:
+            raise HTTPException(409, f"Группа со slug «{slug}» уже существует")
+        group = FeedGroup(slug=slug, title=title)
+        session.add(group)
+        await session.commit()
+    rsscache.invalidate()
+    return {"ok": True, "slug": slug, "feed": f"/rss/{slug}"}
+
+
+@router.patch("/api/admin/groups/{group_id}")
+async def patch_group(group_id: int, body: GroupPatch):
+    async with async_session() as session:
+        group = await session.get(FeedGroup, group_id)
+        if not group:
+            raise HTTPException(404, "Группа не найдена")
+        if body.slug is not None:
+            slug = normalize_slug(body.slug)
+            if not slug:
+                raise HTTPException(400, "Пустой slug")
+            clash = (await session.execute(
+                select(FeedGroup).where(FeedGroup.slug == slug, FeedGroup.id != group_id)
+            )).scalar_one_or_none()
+            if clash:
+                raise HTTPException(409, f"Slug «{slug}» занят другой группой")
+            group.slug = slug
+        if body.title is not None:
+            group.title = body.title.strip()
+        await session.commit()
+    rsscache.invalidate()
+    return {"ok": True}
+
+
+@router.delete("/api/admin/groups/{group_id}")
+async def delete_group(group_id: int):
+    async with async_session() as session:
+        group = await session.get(FeedGroup, group_id)
+        if not group:
+            raise HTTPException(404, "Группа не найдена")
+        # каналы группы возвращаем в «без группы» (персональные фиды не страдают)
+        await session.execute(
+            text("UPDATE channels SET group_id = NULL WHERE group_id = :gid"), {"gid": group_id})
+        await session.delete(group)
         await session.commit()
     rsscache.invalidate()
     return {"ok": True}
@@ -200,6 +267,7 @@ th{background:#131a2e;color:#64748b;font-weight:600;text-align:left;padding:10px
 td{padding:10px 12px;border-top:1px solid #1e293b;vertical-align:middle}
 tr.off{opacity:.45}
 td select{background:#0a0a1a;border:1px solid #1e293b;color:#e2e8f0;padding:5px 8px;border-radius:6px;font-size:13px}
+td input{background:#0a0a1a;border:1px solid #1e293b;color:#e2e8f0;padding:5px 8px;border-radius:6px;font-size:13px}
 .chip{display:inline-block;background:#1e293b;color:#00d4aa;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
 a.feedlink{color:#60a5fa;text-decoration:none;font-size:12px}
 a.feedlink:hover{text-decoration:underline}
@@ -207,7 +275,7 @@ a.feedlink:hover{text-decoration:underline}
 </head>
 <body>
 <div class="wrap">
-<header><h1>TG Parser Dashboard</h1><p class="sub">Админка: каналы, RSS-потоки, доступ</p></header>
+<header><h1>TG Parser Dashboard</h1><p class="sub">Админка: каналы, группы фидов, доступ</p></header>
 <nav>
 <a href="/">&#128240; Posts</a>
 <a href="/charts">&#128202; Charts</a>
@@ -221,26 +289,27 @@ a.feedlink:hover{text-decoration:underline}
 <a href="/admin" class="on">&#9881;&#65039; Admin</a>
 </nav>
 
+<h2>Группы фидов <span class="muted">— каждая группа = свой RSS-поток /rss/{slug}</span></h2>
+<div class="row">
+<input id="new-group-title" placeholder="Название группы (напр. «Дивиденды»)" size="34">
+<input id="new-group-slug" placeholder="slug (необязательно)" size="20">
+<button class="btn" id="add-group">Создать группу</button>
+</div>
+<div class="msg" id="msg0"></div>
+<table><thead><tr>
+<th>Название</th><th>URL фида</th><th>Каналов</th><th>Действия</th>
+</tr></thead><tbody id="group-rows"></tbody></table>
+
 <h2>Каналы</h2>
 <div class="row">
 <input id="new-username" placeholder="@channel или ссылка t.me/..." size="32">
-<select id="new-feed"><option value="">— без потока</option><option value="news">Новости</option><option value="analytics">Аналитика</option></select>
-<button class="btn" id="add">Добавить</button>
-<span class="muted">первичная докачка — 2000 последних постов; изменения подхватывает крон за 5 минут</span>
+<button class="btn" id="add">Добавить канал</button>
+<span class="muted">первичная докачка — 2000 последних постов; группу назначьте ниже в таблице</span>
 </div>
 <div class="msg" id="msg1"></div>
 <table><thead><tr>
-<th>@username</th><th>Название</th><th>Название в RSS</th><th>Постов</th><th>Последний пост</th><th>Прогон / ошибка</th><th>Поток</th><th>Активен</th><th>Фид</th><th>Действия</th>
+<th>@username</th><th>Название</th><th>Название в RSS</th><th>Группа</th><th>Постов</th><th>Последний пост</th><th>Прогон / ошибка</th><th>Активен</th><th>Фид</th><th>Действия</th>
 </tr></thead><tbody id="rows"></tbody></table>
-
-<h2>Названия RSS-потоков</h2>
-<div class="row">
-<input id="t-news" placeholder="Новости" size="30">
-<input id="t-analytics" placeholder="Аналитика" size="30">
-<button class="btn" id="save-titles">Сохранить</button>
-</div>
-<div class="msg" id="msg2"></div>
-<p class="muted" id="feed-urls"></p>
 
 <h2>Доступ</h2>
 <div class="row">
@@ -253,6 +322,7 @@ a.feedlink:hover{text-decoration:underline}
 </div>
 
 <script>
+var GROUPS = [];
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 async function api(method, url, body){
   var r = await fetch(url, {method:method, headers:{'Content-Type':'application/json'},
@@ -261,15 +331,29 @@ async function api(method, url, body){
   if (!r.ok) throw new Error(d.detail || d.error || ('Ошибка '+r.status));
   return d;
 }
+function groupSelect(c){
+  var s = '<select onchange="patch('+c.id+',{group_id:this.value===""?0:parseInt(this.value)})">'
+    + '<option value=""'+((c.group_id==null)?' selected':'')+'>— без группы</option>';
+  GROUPS.forEach(function(g){
+    s += '<option value="'+g.id+'"'+(c.group_id===g.id?' selected':'')+'>'+esc(g.title)+'</option>';
+  });
+  return s + '</select>';
+}
 async function load(){
+  var gd = await api('GET','/api/admin/groups');
+  GROUPS = gd.groups;
+  document.getElementById('group-rows').innerHTML = GROUPS.map(function(g){
+    return '<tr><td><span class="chip">'+esc(g.title)+'</span></td>'
+      + '<td><a class="feedlink" href="/rss/'+esc(g.slug)+'" target="_blank">/rss/'+esc(g.slug)+'</a></td>'
+      + '<td>'+(g.channel_count||0)+'</td>'
+      + '<td><button class="btn sm ghost" onclick="renameGroup('+g.id+",'"+esc(g.title)+"')\">Переименовать</button> "
+      + '<button class="btn sm danger" onclick="delGroup('+g.id+",'"+esc(g.title)+"')\">Удалить</button></td></tr>";
+  }).join('') || '<tr><td colspan="4" class="muted">Групп нет — создайте первую выше</td></tr>';
+
   var d = await api('GET','/api/admin/channels');
   document.getElementById('rows').innerHTML = d.channels.map(function(c){
     var rssInput = '<input size="18" placeholder="как в TG" value="'+esc(c.rss_title||'')+'" '
       + 'onchange="patch('+c.id+',{rss_title:this.value})">';
-    var feedSel = '<select onchange="patch('+c.id+',{feed_type:this.value})">'
-      + '<option value=""'+(c.feed_type?'':' selected')+'>—</option>'
-      + '<option value="news"'+(c.feed_type==='news'?' selected':'')+'>Новости</option>'
-      + '<option value="analytics"'+(c.feed_type==='analytics'?' selected':'')+'>Аналитика</option></select>';
     var err = c.last_error ? '<div class="err" title="'+esc(c.last_error)+'">&#9888;&#65039; '+esc(c.last_error.slice(0,50))+'</div>' : '';
     var run = c.last_run_at ? esc(c.last_run_at.slice(0,16).replace('T',' ')) : '—';
     var last = c.last_post_at ? esc(c.last_post_at.slice(0,16).replace('T',' ')) : '—';
@@ -277,39 +361,43 @@ async function load(){
       + '<td>@'+esc(c.username)+'</td>'
       + '<td>'+esc(c.title||'')+'</td>'
       + '<td>'+rssInput+'</td>'
+      + '<td>'+groupSelect(c)+'</td>'
       + '<td>'+(c.post_count||0)+'</td>'
       + '<td>'+last+'</td>'
       + '<td>'+run+err+'</td>'
-      + '<td>'+feedSel+'</td>'
       + '<td><button class="btn sm ghost" onclick="patch('+c.id+',{is_active:'+(!c.is_active)+'})">'+(c.is_active?'выкл':'вкл')+'</button></td>'
       + '<td><a class="feedlink" href="/rss/'+esc(c.username)+'" target="_blank">RSS</a></td>'
       + '<td><button class="btn sm ghost" onclick="backfill('+c.id+')">Докачать всё</button> '
-      + '<button class="btn sm danger" onclick="del('+c.id+",'"+esc(c.username)+"')">Удалить</button></td></tr>";
+      + '<button class="btn sm danger" onclick="del('+c.id+",'"+esc(c.username)+"')\">Удалить</button></td></tr>";
   }).join('');
-  var s = await api('GET','/api/admin/settings');
-  document.getElementById('t-news').value = s.rss_news_title || '';
-  document.getElementById('t-analytics').value = s.rss_analytics_title || '';
-  document.getElementById('feed-urls').textContent =
-    'Фиды: /rss/news («'+(s.rss_news_title||'Новости')+'») · /rss/analytics («'+(s.rss_analytics_title||'Аналитика')+'») · /rss/{username} на каждый канал · /rss/opml — всё одним файлом';
 }
 async function patch(id, body){ try{ await api('PATCH','/api/admin/channels/'+id, body); load(); }catch(e){ alert(e.message); } }
 async function backfill(id){ try{ var d = await api('POST','/api/admin/channels/'+id+'/backfill'); alert(d.note); }catch(e){ alert(e.message); } }
 async function del(id, name){ if(!confirm('Удалить @'+name+'? Посты выпадут из RSS и статистики.')) return;
   try{ await api('DELETE','/api/admin/channels/'+id); load(); }catch(e){ alert(e.message); } }
+async function renameGroup(id, title){
+  var t = prompt('Новое название группы:', title);
+  if (t === null || !t.trim()) return;
+  try{ await api('PATCH','/api/admin/groups/'+id, {title:t.trim()}); load(); }catch(e){ alert(e.message); }
+}
+async function delGroup(id, title){
+  if(!confirm('Удалить группу «'+title+'»? Каналы останутся (без группы), их фиды не пострадают.')) return;
+  try{ await api('DELETE','/api/admin/groups/'+id); load(); }catch(e){ alert(e.message); }
+}
+document.getElementById('add-group').onclick = async function(){
+  try{ var d = await api('POST','/api/admin/groups',
+    {title:document.getElementById('new-group-title').value,
+     slug:document.getElementById('new-group-slug').value || null});
+    var m=document.getElementById('msg0'); m.textContent='Создана: '+d.feed; m.className='msg ok';
+    document.getElementById('new-group-title').value=''; document.getElementById('new-group-slug').value=''; load();
+  }catch(e){ var m=document.getElementById('msg0'); m.textContent=e.message; m.className='msg err'; }
+};
 document.getElementById('add').onclick = async function(){
   try{ var d = await api('POST','/api/admin/channels',
-    {username:document.getElementById('new-username').value,
-     feed_type:document.getElementById('new-feed').value || null});
+    {username:document.getElementById('new-username').value});
     var m=document.getElementById('msg1'); m.textContent = d.note; m.className='msg ok';
     document.getElementById('new-username').value=''; load();
   }catch(e){ var m=document.getElementById('msg1'); m.textContent = e.message; m.className='msg err'; }
-};
-document.getElementById('save-titles').onclick = async function(){
-  try{ await api('PUT','/api/admin/settings',
-    {rss_news_title:document.getElementById('t-news').value,
-     rss_analytics_title:document.getElementById('t-analytics').value});
-    var m=document.getElementById('msg2'); m.textContent='Сохранено'; m.className='msg ok'; load();
-  }catch(e){ var m=document.getElementById('msg2'); m.textContent=e.message; m.className='msg err'; }
 };
 document.getElementById('save-pwd').onclick = async function(){
   try{ await api('POST','/api/auth/change-password',

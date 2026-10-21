@@ -18,7 +18,7 @@ from sqlalchemy import func, select, text
 import admin
 import auth
 import rsscache
-from db import ParseLog, Post, async_session, ensure_schema, get_setting
+from db import ParseLog, Post, async_session, ensure_schema, get_setting, migrate_groups
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -153,6 +153,7 @@ async def auth_guard(request, call_next):
 @app.on_event("startup")
 async def _startup():
     await ensure_schema()
+    await migrate_groups()
     await auth.ensure_admin()
 
 
@@ -2048,10 +2049,9 @@ async def _rss_feed_impl(limit: int, channel: str):
         return json_response({"error": "internal error"}, 500)  # детали — только в логах
 
 
-# ─── RSS потоки по типу: новости / аналитика ─────────────────
-# Списки каналов админ размечает в /admin (channels.feed_type).
-# Названия фидов — из settings (меняются в админке), fallback — env, дефолт ниже.
-_FEED_DEFAULTS = {"news": "Новости", "analytics": "Аналитика"}
+# ─── RSS: /rss/{slug} — сначала группа, иначе канал ──────────
+# Сводные потоки «Новости»/«Аналитика» — это просто группы с slug news/analytics
+# (создаются миграцией из feed_type), поэтому отдельные роуты не нужны.
 
 
 def _rss_xml(rows, rss_title, rss_link, rss_desc):
@@ -2087,40 +2087,58 @@ def _rss_xml(rows, rss_title, rss_link, rss_desc):
 </rss>"""
 
 
-async def _typed_rss(feed_type: str, limit: int):
+def _rss_response(rss):
+    return HTMLResponse(
+        content=rss,
+        media_type="application/rss+xml; charset=utf-8",
+        headers={"Cache-Control": "max-age=300, public"}
+    )
+
+
+async def _rss_slug_impl(slug_raw: str, limit: int):
     try:
+        slug = slug_raw.strip().lstrip("@").lower()
         async with async_session() as session:
-            title = await get_setting(session, f"rss_{feed_type}_title", "")
-            if not title:
-                title = os.getenv(f"RSS_{feed_type.upper()}_TITLE", _FEED_DEFAULTS[feed_type])
-            result = await session.execute(text("""
-                SELECT p.telegram_message_id, p.text, p.published_at,
-                       c.username, c.title
-                FROM posts p
-                JOIN channels c ON p.channel_id = c.id
-                WHERE c.feed_type = :ft AND c.is_active
-                ORDER BY p.published_at DESC
-                LIMIT :limit
-            """), {"ft": feed_type, "limit": limit})
-            rss = _rss_xml(result.fetchall(), title, "https://t.me/", title)
-            return HTMLResponse(
-                content=rss,
-                media_type="application/rss+xml; charset=utf-8",
-                headers={"Cache-Control": "max-age=300, public"}
-            )
+            # 1) группа?
+            g = (await session.execute(
+                text("SELECT id, slug, title FROM feed_groups WHERE slug = :s"),
+                {"s": slug})).first()
+            if g:
+                gid, gslug, gtitle = g
+                result = await session.execute(text("""
+                    SELECT p.telegram_message_id, p.text, p.published_at,
+                           c.username, c.title
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE c.group_id = :gid AND c.is_active
+                    ORDER BY p.published_at DESC
+                    LIMIT :limit
+                """), {"gid": gid, "limit": limit})
+                return _rss_response(_rss_xml(result.fetchall(), gtitle or gslug,
+                                              f"https://t.me/", f"Лента «{gtitle or gslug}»"))
+            # 2) канал?
+            ch = (await session.execute(
+                text("SELECT username, title, rss_title FROM channels WHERE username = :u AND is_active"),
+                {"u": slug})).first()
+            if ch:
+                ch_username = ch[0]
+                ch_title = ch[2] or ch[1] or ch_username  # кастомное название из админки приоритетнее TG
+                result = await session.execute(text("""
+                    SELECT p.telegram_message_id, p.text, p.published_at,
+                           c.username, c.title
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE c.username = :u AND c.is_active
+                    ORDER BY p.published_at DESC
+                    LIMIT :limit
+                """), {"u": slug, "limit": limit})
+                return _rss_response(_rss_xml(result.fetchall(), ch_title,
+                                              f"https://t.me/{ch_username}",
+                                              f"Лента канала @{ch_username}"))
+            return json_response({"error": f"group or channel '{slug}' not found"}, 404)
     except Exception as e:
-        logger.error(f"/rss/{feed_type} error: {e}"); traceback.print_exc()
+        logger.error(f"/rss/{slug_raw} error: {e}"); traceback.print_exc()
         return json_response({"error": "internal error"}, 500)
-
-
-@app.get("/rss/news")
-async def rss_news(limit: int = Query(50, ge=1, le=200)):
-    return await rsscache.get(f"/rss/news:{limit}", lambda: _typed_rss("news", limit))
-
-
-@app.get("/rss/analytics")
-async def rss_analytics(limit: int = Query(50, ge=1, le=200)):
-    return await rsscache.get(f"/rss/analytics:{limit}", lambda: _typed_rss("analytics", limit))
 
 
 @app.get("/rss/opml")
@@ -2138,10 +2156,13 @@ async def _rss_opml_impl(request: Request):
             return s.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
 
         outlines = []
-        for feed_type, label in (("news", "Поток «Новости»"), ("analytics", "Поток «Аналитика»")):
-            outlines.append(
-                f'<outline text="{esc(label)}" type="rss" xmlUrl="{base}/rss/{feed_type}"/>')
         async with async_session() as session:
+            groups = (await session.execute(
+                text("SELECT slug, title FROM feed_groups ORDER BY title")
+            )).all()
+            for slug, title in groups:
+                outlines.append(
+                    f'<outline text="{esc(title or slug)}" type="rss" xmlUrl="{base}/rss/{slug}"/>')
             rows = (await session.execute(
                 text("SELECT username, title, rss_title FROM channels WHERE is_active ORDER BY username")
             )).all()
@@ -2167,45 +2188,10 @@ async def _rss_opml_impl(request: Request):
         return json_response({"error": "internal error"}, 500)
 
 
-
-# Регистрируется ПОСЛЕ /rss/news и /rss/analytics: литеральные маршруты выигрывают,
-# а /rss/{username} отдаёт отдельный фид на каждый канал (гибкость: подписка
-# в Пульсе на один канал, свои папки из каналов разных потоков и т.п.).
-@app.get("/rss/{username}")
-async def rss_channel(username: str, limit: int = Query(50, ge=1, le=200)):
-    return await rsscache.get(f"/rss/{username}:{limit}", lambda: _rss_channel_impl(username, limit))
-
-
-async def _rss_channel_impl(username: str, limit: int):
-    try:
-        u = username.strip().lstrip("@").lower()
-        async with async_session() as session:
-            ch = (await session.execute(
-                text("SELECT username, title, rss_title FROM channels WHERE username = :u AND is_active"),
-                {"u": u})).first()
-            if not ch:
-                return json_response({"error": f"channel @{u} not found"}, 404)
-            ch_username = ch[0]
-            ch_title = ch[2] or ch[1] or ch_username  # кастомное название из админки приоритетнее TG
-            result = await session.execute(text("""
-                SELECT p.telegram_message_id, p.text, p.published_at,
-                       c.username, c.title
-                FROM posts p
-                JOIN channels c ON p.channel_id = c.id
-                WHERE c.username = :u AND c.is_active
-                ORDER BY p.published_at DESC
-                LIMIT :limit
-            """), {"u": u, "limit": limit})
-            rss = _rss_xml(result.fetchall(), ch_title, f"https://t.me/{ch_username}",
-                           f"Лента канала @{ch_username}")
-            return HTMLResponse(
-                content=rss,
-                media_type="application/rss+xml; charset=utf-8",
-                headers={"Cache-Control": "max-age=300, public"}
-            )
-    except Exception as e:
-        logger.error(f"/rss/{username} error: {e}"); traceback.print_exc()
-        return json_response({"error": "internal error"}, 500)
+@app.get("/rss/{slug}")
+async def rss_by_slug(slug: str, limit: int = Query(50, ge=1, le=200)):
+    """Сводный фид группы (slug группы) либо персональный фид канала (username)."""
+    return await rsscache.get(f"/rss/{slug}:{limit}", lambda: _rss_slug_impl(slug, limit))
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────

@@ -30,7 +30,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
-from db import Channel, ParseLog, Post, async_session, ensure_schema
+from db import Channel, ParseLog, Post, async_session, ensure_schema, migrate_groups
 
 load_dotenv()
 
@@ -114,6 +114,7 @@ class MarketTwitsParser:
 
     async def init_db(self):
         await ensure_schema()
+        await migrate_groups()  # feed_type (env-сид) → feed_groups
 
     # ─── Channel list: DB first, env as first-run seed ───────
     async def get_channels(self, session) -> list[Channel]:

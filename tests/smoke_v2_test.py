@@ -20,7 +20,7 @@ os.environ.setdefault("CHANNELS", "testnews,testanalytics,unassigned")
 
 import auth  # noqa: E402
 import httpx  # noqa: E402
-from db import Channel, ParseLog, Post, Settings, async_session, ensure_schema  # noqa: E402
+from db import Channel, FeedGroup, ParseLog, Post, Settings, async_session, ensure_schema, migrate_groups  # noqa: E402
 from sqlalchemy import delete  # noqa: E402
 from web import app  # noqa: E402
 
@@ -38,6 +38,7 @@ async def wipe_and_seed():
         await s.execute(delete(Post))
         await s.execute(delete(ParseLog))
         await s.execute(delete(Channel))
+        await s.execute(delete(FeedGroup))
         await s.execute(delete(Settings))
         await s.commit()
         ch_news = Channel(username="testnews", title="Тестовые Новости", is_active=True, feed_type="news", telegram_id=111)
@@ -50,7 +51,8 @@ async def wipe_and_seed():
         s.add(Post(channel_id=ch_ana.id, telegram_message_id=1, text="Аналитика: цель по Сберу", views_count=50, hashtags=["#сбер"], published_at=now))
         s.add(Post(channel_id=ch_none.id, telegram_message_id=1, text="Пост без потока", views_count=10, published_at=now))
         await s.commit()
-        return {"testnews": ch_news.id, "testanalytics": ch_ana.id, "unassigned": ch_none.id}
+    await migrate_groups()  # feed_type → группы news/analytics (как в проде)
+    return {"testnews": ch_news.id, "testanalytics": ch_ana.id, "unassigned": ch_none.id}
 
 
 async def main():
@@ -162,9 +164,14 @@ async def main():
         check("/rss/opml: литеральные маршруты не перехвачены {username}",
               "<opml version=\"1.0\">" in body_opml, "")
 
-        await client.put("/api/admin/settings", json={"rss_news_title": "Лента Новостей v2", "rss_analytics_title": "Аналитика v2"})
+        groups = (await client.get("/api/admin/groups")).json()["groups"]
+        g_news = [g for g in groups if g["slug"] == "news"][0]
+        g_ana = [g for g in groups if g["slug"] == "analytics"][0]
+        check("Миграция: группы news/analytics созданы из feed_type",
+              g_news["title"] == "Новости" and g_ana["title"] == "Аналитика", str(groups))
+        await client.patch(f"/api/admin/groups/{g_news['id']}", json={"title": "Лента Новостей v2"})
         r = await client.get("/rss/news")
-        check("C11 title фида из админки", "<title>Лента Новостей v2</title>" in r.text)
+        check("C11 название фида = название группы (переименование)", "<title>Лента Новостей v2</title>" in r.text)
 
         r = await client.patch(f"/api/admin/channels/{ids['testnews']}", json={"username": "@renamed_news"})
         r2 = await client.get("/rss/news")
@@ -172,6 +179,36 @@ async def main():
         check("C8 смена username → сводный фид работает", r.status_code == 200 and "Новость: рост рынка" in r2.text, str(r.status_code))
         check("C8 персональный фид после смены username",
               r3.status_code == 200 and "Новость: рост рынка" in r3.text and "Пост без потока" not in r3.text, str(r3.status_code))
+
+        # CRUD групп: создать, дубликат slug, назначить канал, фид, удалить
+        r = await client.post("/api/admin/groups", json={"title": "Дивиденды"})
+        check("Группы: создание → 201, slug из названия",
+              r.status_code == 201 and r.json()["slug"] == "дивиденды", r.text[:120])
+        r = await client.post("/api/admin/groups", json={"title": "Дивиденды 2", "slug": "дивиденды"})
+        check("Группы: дубликат slug → 409", r.status_code == 409, str(r.status_code))
+        g_div = (await client.get("/api/admin/groups")).json()
+        g_div = [g for g in g_div["groups"] if g["slug"] == "дивиденды"][0]
+        await client.patch(f"/api/admin/channels/{ids['unassigned']}", json={"group_id": g_div["id"]})
+        r = await client.get("/rss/дивиденды")
+        ok_div = (r.status_code == 200 and "Пост без потока" in r.text
+                  and "<title>Дивиденды</title>" in r.text)
+        r2 = await client.get("/rss/news")
+        ok_not_in_news = ("Пост без потока" not in r2.text)
+        check("Группы: канал в группе → фид группы содержит его, сводка news — нет",
+              ok_div and ok_not_in_news, f"div={ok_div}")
+        await client.patch(f"/api/admin/channels/{ids['unassigned']}", json={"group_id": 0})
+        r = await client.get("/rss/дивиденды")
+        check("Группы: убрать канал из группы (group_id=0) → фид пуст", "Пост без потока" not in r.text)
+        await client.patch(f"/api/admin/groups/{g_div['id']}", json={"title": "Облигации"})
+        r = await client.get("/rss/дивиденды")
+        check("Группы: переименование (slug прежний, title новый)",
+              "<title>Облигации</title>" in r.text, str(r.status_code))
+        r = await client.delete(f"/api/admin/groups/{g_div['id']}")
+        r2 = await client.get("/rss/дивиденды")
+        r3 = await client.get(f"/rss/{'unassigned'}")
+        check("Группы: удаление → фид 404, канал жив, персональный фид на месте",
+              r.status_code == 200 and r2.status_code == 404 and r3.status_code == 200,
+              f"{r.status_code}/{r2.status_code}/{r3.status_code}")
 
         await client.post("/api/auth/change-password", json={"current": "test_password_123", "new": "new_password_456"})
         r = await client.get("/api/admin/channels")
